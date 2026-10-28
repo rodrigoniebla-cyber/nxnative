@@ -100,50 +100,9 @@ jobs:
           TAG: ${{ inputs.release_tag }}
           URLS: ${{ inputs.urls }}
         run: |
-          mkdir -p "$GAME_DIR" "$OUT_DIR"
-          cd "$GAME_DIR"
-          if [ -n "$TAG" ]; then
-            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --pattern '*.nsp' --pattern '*.xci' --pattern '*.nsz' --pattern '*.xcz' \
-              --pattern '*.nsp.[0-9]*' --pattern '*.xci.[0-9]*' --pattern '*.nsz.[0-9]*' --pattern '*.xcz.[0-9]*' \
-              || { [ -n "$URLS" ] || exit 1; echo "::warning::no game files from release '$TAG'; using the links only"; }
-          fi
-          for u in $URLS; do
-            echo "downloading ${u%%\?*}"
-            case "$u" in
-              *drive.google.com/*|*drive.usercontent.google.com/*|*docs.google.com/*)
-                command -v gdown >/dev/null || python -m pip install -q gdown==5.2.0
-                case "$u" in */folders/*) kind=--folder ;; *) kind=--fuzzy ;; esac
-                ok=
-                for attempt in 1 2 3; do   # --continue: a retry resumes the file and skips a folder's finished ones
-                  if gdown "$kind" --continue --quiet "$u"; then ok=1; break; fi
-                  sleep 15
-                done
-                if [ -z "$ok" ]; then
-                  echo "::error::Google Drive download failed: is the file or folder shared as 'Anyone with the link'? A file many people downloaded recently is refused for a day"
-                  exit 1
-                fi ;;
-              *) curl -fL --retry 3 --retry-delay 5 -sS -OJ "$u" ;;
-            esac
-          done
-          # a Drive folder lands in a subfolder of its own: its game files and parts come up to the game folder
-          find . -mindepth 2 -type f \( -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' -o -iname '*.nsp.[0-9]*' -o -iname '*.xci.[0-9]*' -o -iname '*.nsz.[0-9]*' -o -iname '*.xcz.[0-9]*' \) -exec mv -n {} . \;
-          # numbered parts → the file they were split from, deleting each part once copied (the disk holds the game about three times over during the build)
-          for first in *.000 *.001; do
-            [ -e "$first" ] || continue
-            base="${first%.*}"
-            [ -e "$base" ] && { echo "::error::both $base and its parts are present"; exit 1; }
-            echo "joining $base"
-            ls -1 -- "$base".[0-9]* | sort | while IFS= read -r part; do cat -- "$part" >> "$base" && rm -- "$part"; done
-          done
-          shopt -s nullglob nocaseglob
-          files=(*.nsp *.xci *.nsz *.xcz)
-          if [ ${#files[@]} = 0 ]; then
-            echo "::error::no .nsp, .xci, .nsz or .xcz file in release '$TAG' or the links"
-            exit 1
-          fi
-          ls -l
-          df -h "$GAME_DIR"
+          mkdir -p "$OUT_DIR"
+          read -ra links <<< "$URLS"   # the links split on spaces, never globbed
+          .github/scripts/fetch_game_files.sh "$GAME_DIR" "$TAG" "${links[@]}"
 
       - name: Free disk space (other Xcodes and the simulators) when the game needs it
         run: |

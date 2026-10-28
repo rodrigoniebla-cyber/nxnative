@@ -1,0 +1,181 @@
+# Builds Mush8 (https://github.com/c22dev/mush8, a native port of Mario Kart 8 Deluxe, a separate project) into an unsigned IPA on GitHub's Macs, with its own `make-ios.sh --ipa`,
+# for AltStore / SideStore / LiveContainer. Run it by hand (Actions → build-mush8 → Run workflow). Mush8 links the game's own code into the app, so the build needs your dump:
+#   - A PRIVATE repository, the PROD_KEYS secret and the game files given as in build-ipa.yml (a release's assets and / or links, Google Drive ones too): the base game and
+#     update 4.0.1 or 3.0.5 as NSPs. The workflow tells them apart by the title ID in their names ([0100152000022000] the base game, [0100152000022800] the update), or by the names
+#     base.nsp and update.nsp; with neither, two NSPs are taken as the bigger one the base game. Other files (the DLC) are not needed for the build and are left out.
+#   - The app is built for that update: on the iPhone or iPad, import the same update into it, with prod.keys, the base game, the Firmware folder dumped from your Switch and
+#     optionally the Booster Course Pass as dlc.nsp (the Files app → On My iPhone → Mush8). Its README lists what it needs.
+# The IPA goes to the release (`output: release`; release_tag, else a release named `builds`) or is a workflow artifact kept 3 days. A sideloaded IPA runs with the 5 GB memory layout
+# (Mush8's README: no extended virtual addressing entitlement). The game's shaders are compiled for iOS on the first build and kept in the Actions cache for the next ones.
+name: build-mush8
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release whose assets are the base game and the update NSPs (or their .001 parts); empty = only the links below
+        default: game-files
+      urls:
+        description: Links of the game files, separated by spaces - direct links, or Google Drive share links of files or a folder (optional)
+        default: ''
+      mush8_ref:
+        description: Mush8 branch, tag or commit to build
+        default: main
+      bundle_id:
+        description: The app's bundle ID (empty = Mush8's own, ch.cclerc.mush8)
+        default: ''
+      output:
+        description: release = upload the IPA to the release above; artifact = a workflow artifact kept 3 days
+        type: choice
+        options: [release, artifact]
+        default: release
+
+permissions:
+  contents: write   # read the release's assets in a private repository, and upload the IPA to it
+
+concurrency:
+  group: build-mush8
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  RUST: 1.98.1   # the toolchain make-ios.sh builds the iOS host with
+
+defaults:
+  run:
+    shell: bash
+
+# Actions are pinned to commit SHAs (the tag in the comment), as in tests.yml.
+jobs:
+  build:
+    name: Build Mush8
+    runs-on: macos-26   # Mush8 needs Xcode 26 or later
+    timeout-minutes: 240
+    steps:
+      - name: Private repository and prod.keys
+        env:
+          PRIVATE: ${{ github.event.repository.private }}
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+        run: |
+          { echo "GAME_DIR=$RUNNER_TEMP/game"; echo "OUT_DIR=$RUNNER_TEMP/out"; } >> "$GITHUB_ENV"
+          if [ "$PRIVATE" != true ]; then
+            echo "::error::$GITHUB_REPOSITORY is public: its releases and artifacts can be downloaded by anyone, and the IPA holds the game's code. Run this workflow in a private copy of the repository (see the top of .github/workflows/build-ipa.yml)."
+            exit 1
+          fi
+          if [ -z "$PROD_KEYS" ]; then
+            echo "::error::no PROD_KEYS secret: add the text of your prod.keys under Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: c22dev/mush8
+          ref: ${{ inputs.mush8_ref }}
+          path: mush8
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'   # for gdown (Google Drive links)
+
+      - name: Download the game files
+        env:
+          TAG: ${{ inputs.release_tag }}
+          URLS: ${{ inputs.urls }}
+        run: |
+          mkdir -p "$OUT_DIR"
+          read -ra links <<< "$URLS"   # the links split on spaces, never globbed
+          .github/scripts/fetch_game_files.sh "$GAME_DIR" "$TAG" "${links[@]}"
+
+      - name: Base game, update and prod.keys into Mush8's folder
+        env:
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+        run: |
+          shopt -s nullglob nocaseglob
+          cd "$GAME_DIR"
+          base= update=
+          for f in *.nsp; do
+            case "$f" in
+              *0100152000022000*|base.nsp) base=$f ;;
+              *0100152000022800*|update.nsp|upd4-0-1.nsp) update=$f ;;
+            esac
+          done
+          nsps=(*.nsp)
+          if { [ -z "$base" ] || [ -z "$update" ]; } && [ ${#nsps[@]} = 2 ]; then   # no names to go by: the base game is the bigger one
+            if [ "$(stat -f %z "${nsps[0]}")" -gt "$(stat -f %z "${nsps[1]}")" ]; then base=${nsps[0]} update=${nsps[1]}; else base=${nsps[1]} update=${nsps[0]}; fi
+            echo "::warning::taking '$base' as the base game and '$update' as the update, by size (name them base.nsp and update.nsp to say so)"
+          fi
+          if [ -z "$base" ] || [ -z "$update" ] || [ "$base" = "$update" ]; then
+            echo "::error::could not tell the base game and the update apart among: ${nsps[*]}. Name them base.nsp and update.nsp, or keep the title IDs ([0100152000022000], [0100152000022800]) in their names. Mush8 takes NSPs, not XCI or NSZ"
+            exit 1
+          fi
+          echo "base game: $base"; echo "update: $update"
+          mv -- "$base" "$GITHUB_WORKSPACE/mush8/base.nsp"
+          mv -- "$update" "$GITHUB_WORKSPACE/mush8/update.nsp"
+          ( umask 077; printf '%s\n' "$PROD_KEYS" > "$GITHUB_WORKSPACE/mush8/prod.keys" )   # Mush8's tools read it from their folder; git ignores it there
+
+      - name: Install the tools (Mush8's README)
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          command -v rustup >/dev/null || { brew install rustup && echo "$(brew --prefix rustup)/bin" >> "$GITHUB_PATH" && export PATH="$(brew --prefix rustup)/bin:$PATH"; }
+          rustup toolchain install "$RUST" --profile minimal --target aarch64-apple-ios
+          rustup default "$RUST"   # the Mac tools (cargo build --release) and the iOS host with one toolchain
+          command -v xcodegen >/dev/null || brew install xcodegen
+          xcodebuild -downloadComponent MetalToolchain || echo "::warning::no Metal Toolchain: the shaders are compiled on the device while playing instead"
+          xcodebuild -version
+          cargo --version
+
+      - name: Shader cache from earlier builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: mush8/work/shader_cache_ios.noindex
+          key: mush8-ios-shaders-${{ github.run_id }}
+          restore-keys: mush8-ios-shaders-
+
+      - name: Build the IPA (make-ios.sh --ipa)
+        working-directory: mush8
+        env:
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+        run: |
+          [ -n "$BUNDLE_ID" ] || unset BUNDLE_ID
+          git rev-parse HEAD
+          rc=0
+          ./make-ios.sh --ipa || rc=$?
+          rm -f prod.keys
+          [ $rc = 0 ] || { [ -f work/precompile_ios.log ] && tail -40 work/precompile_ios.log; exit $rc; }
+          mv build/Mush8.ipa "$OUT_DIR/Mush8.ipa"
+          ls -l "$OUT_DIR"
+
+      - name: Upload to the release
+        if: inputs.output == 'release'
+        env:
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          [ -n "$TAG" ] || TAG=builds
+          cd "$OUT_DIR"
+          if [ "$(stat -f %z Mush8.ipa)" -ge 2147483648 ]; then   # a release asset must be smaller than 2 GiB
+            split -b 1900m -d -a 3 Mush8.ipa Mush8.ipa. && rm Mush8.ipa
+            echo "::notice::Mush8.ipa is 2 GiB or more and was split into parts: join them with  cat Mush8.ipa.0* > Mush8.ipa"
+          fi
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes 'Built by the build-ipa and build-mush8 workflows.'
+          gh release upload "$TAG" ./* --repo "$GITHUB_REPOSITORY" --clobber
+          echo "::notice::uploaded to release $TAG: $(ls | tr '\n' ' ')"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: inputs.output == 'artifact'
+        with:
+          name: Mush8.ipa
+          path: ${{ env.OUT_DIR }}
+          compression-level: 0   # an IPA is a zip already
+          retention-days: 3
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: mush8-logs
+          path: mush8/work/*.log
+          if-no-files-found: ignore
+          retention-days: 7
