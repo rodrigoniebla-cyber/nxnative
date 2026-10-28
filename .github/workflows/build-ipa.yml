@@ -5,7 +5,9 @@
 #   - The repository secret PROD_KEYS (Settings → Secrets and variables → Actions → New repository secret): the whole text of your prod.keys, pasted as it is. It is written to a
 #     file on the runner and never printed.
 #   - The game files: the base game (.nsp, .xci, .nsz or .xcz), and its update and DLC NSPs if you have them, as assets of a release of this repository (Releases → Draft a new
-#     release, tag e.g. `game-files`, attach the files; give the tag as `release_tag`), or as direct download links (`urls`), or both. One game per run.
+#     release, tag e.g. `game-files`, attach the files; give the tag as `release_tag`), or as links (`urls`), or both. One game per run.
+#     A link is a direct download link, or a Google Drive share link of a file or of a folder holding the game's files (shared as "Anyone with the link"; gdown takes it past
+#     Drive's large-file page). Drive refuses a file that many people downloaded in the last day ("Too many users have viewed or downloaded this file recently"): your own copy is not.
 #     A release asset must be smaller than 2 GiB: split a bigger file into numbered parts, which the workflow joins again (`name.nsp.001`, `name.nsp.002`, … or `.000`, `.001`, …):
 #       macOS / Linux: split -b 1900m -d -a 3 "Game [v0].nsp" "Game [v0].nsp."      Windows: 7-Zip → File → Split file…, volume size 1900M
 # The IPA goes back to the same release as an asset (`output: release`, split the same way when it is 2 GiB or more: join with `cat name.ipa.0* > name.ipa`), or is kept as a
@@ -22,7 +24,7 @@ on:
         description: Release whose assets are the game files (.nsp / .xci / .nsz / .xcz, or their .001 parts); empty = only the links below
         default: game-files
       urls:
-        description: Direct download links of game files, separated by spaces (optional)
+        description: Links of game files, separated by spaces - direct links, or Google Drive share links of files or a folder (optional)
         default: ''
       platform:
         description: ios = an unsigned IPA to sideload; mac-app = a Mac app of the game
@@ -89,6 +91,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'   # 3.12 or newer; 3.14 needs no backports.zstd
 
       - name: Download the game files
         env:
@@ -105,8 +110,24 @@ jobs:
           fi
           for u in $URLS; do
             echo "downloading ${u%%\?*}"
-            curl -fL --retry 3 --retry-delay 5 -sS -OJ "$u"
+            case "$u" in
+              *drive.google.com/*|*drive.usercontent.google.com/*|*docs.google.com/*)
+                command -v gdown >/dev/null || python -m pip install -q gdown==5.2.0
+                case "$u" in */folders/*) kind=--folder ;; *) kind=--fuzzy ;; esac
+                ok=
+                for attempt in 1 2 3; do   # --continue: a retry resumes the file and skips a folder's finished ones
+                  if gdown "$kind" --continue --quiet "$u"; then ok=1; break; fi
+                  sleep 15
+                done
+                if [ -z "$ok" ]; then
+                  echo "::error::Google Drive download failed: is the file or folder shared as 'Anyone with the link'? A file many people downloaded recently is refused for a day"
+                  exit 1
+                fi ;;
+              *) curl -fL --retry 3 --retry-delay 5 -sS -OJ "$u" ;;
+            esac
           done
+          # a Drive folder lands in a subfolder of its own: its game files and parts come up to the game folder
+          find . -mindepth 2 -type f \( -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' -o -iname '*.nsp.[0-9]*' -o -iname '*.xci.[0-9]*' -o -iname '*.nsz.[0-9]*' -o -iname '*.xcz.[0-9]*' \) -exec mv -n {} . \;
           # numbered parts → the file they were split from, deleting each part once copied (the disk holds the game about three times over during the build)
           for first in *.000 *.001; do
             [ -e "$first" ] || continue
@@ -138,9 +159,6 @@ jobs:
             df -h "$GAME_DIR"
           fi
 
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: '3.14'   # 3.12 or newer; 3.14 needs no backports.zstd
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: '10.0.x'
