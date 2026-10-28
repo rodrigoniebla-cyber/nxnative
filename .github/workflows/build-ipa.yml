@@ -1,0 +1,226 @@
+# Packs your own game into an unsigned IPA (or a Mac app) on GitHub's Macs, with scripts/build_ipa_from_nsp.py: the same build as README's "Build from the command line", with no Mac of your own.
+# Run it by hand (Actions → build-ipa → Run workflow). It needs:
+#   - A PRIVATE repository. A release asset or a workflow artifact in a public repository can be downloaded by anyone, so this workflow stops on a public one; a fork of a public
+#     repository is always public, so make a private copy instead (GitHub → New repository → Import a repository, or `git push --mirror` into an empty private repository).
+#   - The repository secret PROD_KEYS (Settings → Secrets and variables → Actions → New repository secret): the whole text of your prod.keys, pasted as it is. It is written to a
+#     file on the runner and never printed.
+#   - The game files: the base game (.nsp, .xci, .nsz or .xcz), and its update and DLC NSPs if you have them, as assets of a release of this repository (Releases → Draft a new
+#     release, tag e.g. `game-files`, attach the files; give the tag as `release_tag`), or as direct download links (`urls`), or both. One game per run.
+#     A release asset must be smaller than 2 GiB: split a bigger file into numbered parts, which the workflow joins again (`name.nsp.001`, `name.nsp.002`, … or `.000`, `.001`, …):
+#       macOS / Linux: split -b 1900m -d -a 3 "Game [v0].nsp" "Game [v0].nsp."      Windows: 7-Zip → File → Split file…, volume size 1900M
+# The IPA goes back to the same release as an asset (`output: release`, split the same way when it is 2 GiB or more: join with `cat name.ipa.0* > name.ipa`), or is kept as a
+# workflow artifact for 3 days (`output: artifact`; a private repository's artifact storage on GitHub's free plan is 500 MB, too little for most games).
+# Limits: GitHub's macOS runners are virtual Macs without Metal 4 (tests.yml, issue #112), so a game whose build boots it on the Mac to capture its run-time shaders (an NVN game that
+# compiles them with GLSLC) or to check a provisional profile's heap may stop at that step; the build log (artifact build-logs) says where. A private repository's macOS minutes
+# count ten times against the plan's included minutes, and one first build takes 30-60 minutes.
+name: build-ipa
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release whose assets are the game files (.nsp / .xci / .nsz / .xcz, or their .001 parts); empty = only the links below
+        default: game-files
+      urls:
+        description: Direct download links of game files, separated by spaces (optional)
+        default: ''
+      platform:
+        description: ios = an unsigned IPA to sideload; mac-app = a Mac app of the game
+        type: choice
+        options: [ios, mac-app]
+        default: ios
+      package:
+        description: Version to pack, e.g. v327680 (empty = the newest in the files)
+        default: ''
+      language:
+        description: Game language, a code or a name, e.g. ja, fr, Spanish (empty = English)
+        default: ''
+      app_name:
+        description: App name on the home screen (empty = the game's name)
+        default: ''
+      allow_other_metal:
+        description: Build the shaders even when the runner's Metal compiler is not the one dmsh_chain.lock names (Xcode 27.1)
+        type: boolean
+        default: false
+      output:
+        description: release = upload the result to the release above; artifact = a workflow artifact kept 3 days
+        type: choice
+        options: [release, artifact]
+        default: release
+
+permissions:
+  contents: write   # read the release's assets in a private repository, and upload the result to it
+
+concurrency:
+  group: build-ipa
+  cancel-in-progress: false
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer   # the toolchain the project supports, as in tests.yml
+  GH_TOKEN: ${{ github.token }}
+
+defaults:
+  run:
+    shell: bash
+
+# Actions are pinned to commit SHAs (the tag in the comment), as in tests.yml.
+jobs:
+  build:
+    name: Pack the game
+    runs-on: xcode-27
+    timeout-minutes: 360
+    steps:
+      - name: Private repository and prod.keys
+        env:
+          PRIVATE: ${{ github.event.repository.private }}
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+        run: |
+          # outside the checkout: game files never go into the repository
+          { echo "GAME_DIR=$RUNNER_TEMP/game"; echo "OUT_DIR=$RUNNER_TEMP/out"; } >> "$GITHUB_ENV"
+          if [ "$PRIVATE" != true ]; then
+            echo "::error::$GITHUB_REPOSITORY is public: its releases and artifacts can be downloaded by anyone. Run this workflow in a private copy of the repository (see the top of .github/workflows/build-ipa.yml)."
+            exit 1
+          fi
+          if [ -z "$PROD_KEYS" ]; then
+            echo "::error::no PROD_KEYS secret: add the text of your prod.keys under Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the game files
+        env:
+          TAG: ${{ inputs.release_tag }}
+          URLS: ${{ inputs.urls }}
+        run: |
+          mkdir -p "$GAME_DIR" "$OUT_DIR"
+          cd "$GAME_DIR"
+          if [ -n "$TAG" ]; then
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern '*.nsp' --pattern '*.xci' --pattern '*.nsz' --pattern '*.xcz' \
+              --pattern '*.nsp.[0-9]*' --pattern '*.xci.[0-9]*' --pattern '*.nsz.[0-9]*' --pattern '*.xcz.[0-9]*' \
+              || { [ -n "$URLS" ] || exit 1; echo "::warning::no game files from release '$TAG'; using the links only"; }
+          fi
+          for u in $URLS; do
+            echo "downloading ${u%%\?*}"
+            curl -fL --retry 3 --retry-delay 5 -sS -OJ "$u"
+          done
+          # numbered parts → the file they were split from, deleting each part once copied (the disk holds the game about three times over during the build)
+          for first in *.000 *.001; do
+            [ -e "$first" ] || continue
+            base="${first%.*}"
+            [ -e "$base" ] && { echo "::error::both $base and its parts are present"; exit 1; }
+            echo "joining $base"
+            ls -1 -- "$base".[0-9]* | sort | while IFS= read -r part; do cat -- "$part" >> "$base" && rm -- "$part"; done
+          done
+          shopt -s nullglob nocaseglob
+          files=(*.nsp *.xci *.nsz *.xcz)
+          if [ ${#files[@]} = 0 ]; then
+            echo "::error::no .nsp, .xci, .nsz or .xcz file in release '$TAG' or the links"
+            exit 1
+          fi
+          ls -l
+          df -h "$GAME_DIR"
+
+      - name: Free disk space (other Xcodes and the simulators) when the game needs it
+        run: |
+          need=$(( $(du -sk "$GAME_DIR" | cut -f1) * 3 / 1024 / 1024 + 15 ))   # GB: twice the game's size plus 10 GB (README), and the downloads themselves
+          free=$(df -k "$GAME_DIR" | awk 'NR==2 {print int($4 / 1024 / 1024)}')
+          echo "free: ${free} GB, needed: about ${need} GB"
+          if [ "$free" -lt "$need" ]; then
+            for x in /Applications/Xcode*.app; do
+              [ "$x" = /Applications/Xcode_27.1.app ] || [ "$(readlink -f "$x")" = /Applications/Xcode_27.1.app ] || sudo rm -rf "$x"
+            done
+            xcrun simctl delete all 2>/dev/null || true
+            sudo rm -rf ~/Library/Developer/CoreSimulator /Library/Developer/CoreSimulator/Volumes 2>/dev/null || true
+            df -h "$GAME_DIR"
+          fi
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'   # 3.12 or newer; 3.14 needs no backports.zstd
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'
+      - name: Install the tools (README step 1)
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          python -m pip install lz4 capstone fonttools nsz
+          brew install xcodegen zstd glslang
+          xcodebuild -downloadComponent MetalToolchain || true   # present on the image already, usually
+          xcodebuild -version
+          xcrun metal --version
+          python dm/gfx/tools/own_compilers.py --check-metal || echo "::warning::the Metal compiler is not the one dmsh_chain.lock names: an NVN game's shaders build only with allow_other_metal"
+
+      - name: Build
+        env:
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+          PLATFORM: ${{ inputs.platform }}
+          PACKAGE: ${{ inputs.package }}
+          LANGUAGE: ${{ inputs.language }}
+          APP_NAME: ${{ inputs.app_name }}
+          ALLOW_OTHER_METAL: ${{ inputs.allow_other_metal }}
+        run: |
+          keys="$RUNNER_TEMP/prod.keys"
+          ( umask 077; printf '%s\n' "$PROD_KEYS" > "$keys" )
+          args=(--keys "$keys" --platform "$PLATFORM" --progress lines)
+          [ -n "$PACKAGE" ] && args+=(--package "$PACKAGE")
+          [ -n "$LANGUAGE" ] && args+=(--language "$LANGUAGE")
+          [ -n "$APP_NAME" ] && args+=(--app-name "$APP_NAME")
+          [ "$ALLOW_OTHER_METAL" = true ] && args+=(--allow-other-metal)
+          [ "$PLATFORM" = ios ] && args+=(--no-keep-extracted)   # the Mac app is made of the extracted files, so the script keeps them for it
+          rc=0
+          python scripts/build_ipa_from_nsp.py "$GAME_DIR" "${args[@]}" || rc=$?
+          rm -f "$keys"
+          exit $rc
+
+      - name: Collect the result
+        id: result
+        run: |
+          shopt -s nullglob
+          cd "$GAME_DIR"
+          for f in *.ipa; do mv -- "$f" "$OUT_DIR/"; done
+          for a in *.app; do ditto -c -k --keepParent "$a" "$OUT_DIR/$a.zip"; done   # a .app is a folder: zipped with its signature and links intact
+          cd "$OUT_DIR"
+          files=(*)
+          if [ ${#files[@]} = 0 ]; then echo "::error::the build made no IPA or app"; exit 1; fi
+          for f in "${files[@]}"; do
+            if [ "$(stat -f %z "$f")" -ge 2147483648 ]; then   # a release asset must be smaller than 2 GiB
+              split -b 1900m -d -a 3 "$f" "$f." && rm -- "$f"
+              echo "::notice::$f is 2 GiB or more and was split into parts: join them with  cat \"$f\".0* > \"$f\""
+            fi
+          done
+          ls -l
+          echo "name=$(basename "${files[0]}")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to the release
+        if: inputs.output == 'release'
+        env:
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          [ -n "$TAG" ] || TAG=builds
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes 'Built by the build-ipa workflow.'
+          gh release upload "$TAG" "$OUT_DIR"/* --repo "$GITHUB_REPOSITORY" --clobber
+          echo "::notice::uploaded to release $TAG: $(cd "$OUT_DIR" && ls | tr '\n' ' ')"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: inputs.output == 'artifact'
+        with:
+          name: ${{ steps.result.outputs.name }}
+          path: ${{ env.OUT_DIR }}
+          compression-level: 0   # an IPA is a zip already
+          retention-days: 3
+
+      # each step's full output (no key values: the script never prints them), and a game without a profile's survey
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: build-logs
+          path: |
+            ${{ env.GAME_DIR }}/*_build/logs
+            ${{ env.GAME_DIR }}/*_survey
+          if-no-files-found: ignore
+          retention-days: 7

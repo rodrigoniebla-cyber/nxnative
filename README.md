@@ -46,6 +46,10 @@ The IPA appears in the game's folder. The first build takes 30–60 minutes and 
 
 To play on the Mac instead, add `--platform mac-app`: you get a Mac app of the game to open from Finder. All options: [The packing script in detail](docs/development.md#the-packing-script-in-detail).
 
+### Build on GitHub's Macs
+
+No Mac? The `build-ipa` workflow runs the same build on GitHub's Macs. In a **private** copy of this repository (it refuses to run on a public one, whose releases and artifacts anyone can download), add your `prod.keys` text as the Actions secret `PROD_KEYS`. Then attach the game files (the `.xci`, or the base game, update and DLC `.nsp` files) to a release tagged `game-files`, and run it from Actions → build-ipa → Run workflow. The IPA is uploaded to the same release. Release files must be under 2 GiB, so split bigger ones into numbered parts (`split -b 1900m -d -a 3 Game.nsp Game.nsp.`, or 7-Zip's Split file); the workflow joins them again. Details and limits: the comment at the top of [build-ipa.yml](.github/workflows/build-ipa.yml).
+
 ### Install
 
 Install the IPA on your iPhone or iPad with a sideloading tool such as AltStore, Sideloadly or LiveContainer. If your tool offers **Increased Memory Limit**, turn it on: the bigger games need it.
