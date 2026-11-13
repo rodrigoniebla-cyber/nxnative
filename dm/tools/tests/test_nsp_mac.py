@@ -1,4 +1,4 @@
-"""NSP script Mac-only build (scripts/build_ipa_from_nsp.py --platform mac): the shader steps build only the Mac's libraries, each output keeps its own reuse key, a Mac-only build is
+"""NSP script Mac-only build (scripts/build_ipa_from_nsp.py --platform mac), and what --platform both adds (both shader targets in one run, the disk image) and the Finder dialogs: the shader steps build only the Mac's libraries, each output keeps its own reuse key, a Mac-only build is
 rebuilt after an iOS-only NVN build and an iOS build is not reused after a Mac-only one, neither key without the Mac outputs' stamp (inputs.tsv, which the one
 chain version's c1_full.tsv / cb_extent.tsv name); the run command's environment file is read as the iOS app reads it.
 No game files, keys or Xcode needed (temporary files only in a temporary folder)."""
@@ -83,9 +83,24 @@ class Nvn(Base):
         for cm in (mock.patch.object(nsp, 'fingerprint', lambda *a, **k: 'K'), mock.patch.object(nsp, 'chain_of', lambda repo: CHAIN)):   # one chain version for every game
             cm.__enter__(); self.addCleanup(cm.__exit__, None, None, None)
 
-    def build(self, mac):
+    def build(self, mac, both=False):
         self.ran.clear()
-        return nsp.build_shaders(sys.executable, REPO, self.sh, REPO / 'dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate', {'WORK': str(self.tmp), 'IOSOUT': '/elsewhere'}, self.logs, self.g, pkg_key='P', mac=mac)
+        return nsp.build_shaders(sys.executable, REPO, self.sh, REPO / 'dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate', {'WORK': str(self.tmp), 'IOSOUT': '/elsewhere'}, self.logs, self.g, pkg_key='P', mac=mac, both=both)
+
+    def test_both(self):   # PLATFORM 'both': one dmsh_build.py run for both targets, the iOS folder returned, both keys written
+        self.assertEqual(self.build(False, both=True), self.sh / 'ios')
+        self.assertEqual(len(self.ran), 1); self.assertEqual(self.ran[0][1]['DMSH_TARGETS'], 'mac,ios'); self.assertEqual(self.ran[0][1]['IOSOUT'], str(self.sh / 'ios'))
+        for d in (self.sh / 'ios', self.sh / 'cache'): self.assertTrue(list(d.glob(f'b-{CHAIN}/*_b.metallib')))
+        self.assertEqual(self.build(False, both=True), self.sh / 'ios'); self.assertEqual(self.ran, [])   # reused
+        self.assertEqual(self.build(True), self.sh / 'cache'); self.assertEqual(self.ran, [])   # either target alone too
+        self.assertEqual(self.build(False), self.sh / 'ios'); self.assertEqual(self.ran, [])
+
+    def test_both_after_one_target(self):   # an iOS-only or Mac-only build made one target's libraries: a 'both' build runs again
+        for mac in (False, True):
+            with self.subTest(mac=mac):
+                shutil.rmtree(self.sh, ignore_errors=True)
+                self.build(mac)
+                self.assertEqual(self.build(False, both=True), self.sh / 'ios'); self.assertEqual(len(self.ran), 1)
 
     def test_mac_only(self):   # no IOSOUT (not even the caller's), the Mac key beside the cache folder, not in it
         self.assertEqual(self.build(True), self.sh / 'cache')
@@ -159,3 +174,70 @@ class EnvFile(Base):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class Picker(unittest.TestCase):   # a missing NSP folder or prod.keys: a Finder dialog on a Mac, typed elsewhere
+    def osa(self, rc, out='', err=''):
+        return mock.patch.object(nsp.subprocess, 'run', return_value=types.SimpleNamespace(returncode=rc, stdout=out, stderr=err))
+
+    def mac(self, **env):
+        return mock.patch.multiple(nsp.sys, platform='darwin'), mock.patch.dict(nsp.os.environ, env), mock.patch.object(nsp.shutil, 'which', return_value='/usr/bin/osascript')
+
+    def test_dialog(self):
+        a, b, c = self.mac()
+        with a, b, c, self.osa(0, '/Volumes/Games/Mario/\n') as r:
+            nsp.os.environ.pop('SSH_CONNECTION', None)
+            self.assertEqual(nsp.choose('folder', 'Choose it', 'the NSP folder'), '/Volumes/Games/Mario/')
+            self.assertIn('POSIX path of (choose folder with prompt "Choose it")', r.call_args[0][0])
+
+    def test_cancel_stops(self):
+        a, b, c = self.mac()
+        with a, b, c, self.osa(1, err='execution error: User canceled. (-128)'):
+            nsp.os.environ.pop('SSH_CONNECTION', None)
+            with self.assertRaisesRegex(nsp.BuildError, 'no prod.keys chosen'): nsp.choose('file', 'Choose it', 'prod.keys')
+
+    def test_no_dialog(self):   # over SSH, off the Mac, or when osascript fails: typed
+        a, b, c = self.mac(SSH_CONNECTION='1 2 3 4')
+        with a, b, c, self.osa(0, '/x') as r:
+            self.assertIsNone(nsp.choose('folder', 'Choose it', 'the NSP folder')); r.assert_not_called()
+        with mock.patch.multiple(nsp.sys, platform='linux'): self.assertIsNone(nsp.choose('folder', 'Choose it', 'the NSP folder'))
+        a, b, c = self.mac()
+        with a, b, c, self.osa(1, err='no window server'):
+            nsp.os.environ.pop('SSH_CONNECTION', None)
+            self.assertIsNone(nsp.choose('folder', 'Choose it', 'the NSP folder'))
+
+    def test_ask_takes_the_dialog(self):
+        with mock.patch.object(nsp, 'choose', return_value='/picked'), mock.patch.object(nsp.PROG, 'mode', 'bar'):
+            self.assertEqual(nsp.ask('NSP folder: ', 'the NSP folder', ('folder', 'Choose it')), '/picked')
+
+
+class Dmg(Base):   # PLATFORM 'both': the Mac app in a disk image, made again only when the app changed
+    def setUp(self):
+        super().setUp()
+        self.app = self.tmp / 'Game.app'; (self.app / 'Contents/MacOS').mkdir(parents=True); (self.app / 'Contents/MacOS/dmhost').write_bytes(b'host')
+        self.work, self.dmg, self.made = self.tmp / 'build', self.tmp / 'Game.dmg', []
+        self.work.mkdir()
+        for cm in (mock.patch.object(nsp, 'run', self.fake_hdiutil), mock.patch.object(nsp, 'free_gb', return_value=100.0),
+                   mock.patch.object(nsp.subprocess, 'run', side_effect=self.fake_cp)):
+            cm.__enter__(); self.addCleanup(cm.__exit__, None, None, None)
+
+    def fake_cp(self, cmd, **kw):   # cp -cR: the staged app
+        shutil.copytree(cmd[-2], Path(cmd[-1]) / Path(cmd[-2]).name); return types.SimpleNamespace(returncode=0)
+
+    def fake_hdiutil(self, cmd, log, env=None, cwd=None, on_line=None):
+        cmd = [str(c) for c in cmd]
+        src = Path(cmd[cmd.index('-srcfolder') + 1])
+        self.made.append(sorted(p.name for p in src.iterdir()))
+        self.assertTrue((src / 'Applications').is_symlink())
+        on_line('PERCENT:-1.0'); on_line('PERCENT:50.0')
+        Path(cmd[-1]).write_bytes(b'dmg' * len(self.made))
+
+    def test_made_then_reused(self):
+        nsp.mac_dmg(self.app, self.dmg, 'Game', self.work, {}, self.logs)
+        self.assertEqual(self.made, [['Applications', 'Game.app']]); self.assertTrue(self.dmg.is_file())
+        self.assertFalse((self.work / 'dmg').exists()); self.assertFalse(self.dmg.with_name('Game.partial.dmg').exists())
+        nsp.mac_dmg(self.app, self.dmg, 'Game', self.work, {}, self.logs); self.assertEqual(len(self.made), 1)
+        (self.app / 'Contents/MacOS/dmhost').write_bytes(b'host2')   # a changed app
+        nsp.mac_dmg(self.app, self.dmg, 'Game', self.work, {}, self.logs); self.assertEqual(len(self.made), 2)
+        self.dmg.unlink()   # the image gone
+        nsp.mac_dmg(self.app, self.dmg, 'Game', self.work, {}, self.logs); self.assertEqual(len(self.made), 3)

@@ -42,9 +42,9 @@ python3 -m pip install lz4 capstone fonttools nsz "backports.zstd; python_versio
 python3 scripts/build_ipa_from_nsp.py ~/Games/MarioWonder -k ~/keys/prod.keys
 ```
 
-The IPA appears in the game's folder. The first build takes 30–60 minutes and needs free disk space of about twice the game's size plus 10 GB; building again is much faster.
+On a Mac with Apple silicon one run makes both: the IPA for the iPhone and `<game name>.dmg` for the Mac (open it and drag the game onto Applications), in the game's folder. Leave out the folder or `-k` and Finder asks for them. The first build takes 30–60 minutes and needs free disk space of about twice the game's size plus 10 GB; building again is much faster.
 
-To play on the Mac instead, add `--platform mac-app`: you get a Mac app of the game to open from Finder. All options: [The packing script in detail](docs/development.md#the-packing-script-in-detail).
+Only one of them: `--platform ios` for the IPA (the only choice on an Intel Mac), `--platform mac-app` for the Mac app alone. All options: [The packing script in detail](docs/development.md#the-packing-script-in-detail).
 
 ### Install
 

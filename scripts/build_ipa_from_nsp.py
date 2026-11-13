@@ -12,7 +12,9 @@
 # PLATFORM = 'mac-app' / --platform mac-app: everything 'mac' builds, then a self-contained, double-clickable Mac app of the game (dm/mac/pack_app.py) in the NSP folder, <game name>.app (OUT_IPA / -o
 #   names another path): the launcher dm/mac/launcher.c, the Mac host, the RomFS (APFS clones on the build's volume), the Mac shader libraries, the DLC and the rewritten modules inside it; the save
 #   in ~/Library/Application Support/nxnative/<title ID>/, the log in ~/Library/Logs/nxnative/<title ID>.log. Signed ad-hoc, or with MAC_SIGN / --mac-sign; no hardened runtime, no notarization.
-# Two ways to run it: open this file in Spyder and press F5 (it uses the values under "Settings" below; an empty NSP folder or prod.keys is asked for at run time);
+# PLATFORM = 'both' / --platform both (the default on a Mac with Apple silicon; elsewhere the default is 'ios'): one run makes the IPA and the Mac app, each with its own shader libraries from one shader build, then puts the
+#   Mac app in a disk image beside it, <game name>.dmg (mac_dmg: lzfse-compressed, with a link to /Applications to drag the app onto). -o / OUT_IPA names the IPA; the app and the disk image go to the NSP folder.
+# Two ways to run it: open this file in Spyder and press F5 (it uses the values under "Settings" below; an empty NSP folder or prod.keys is asked for at run time: on a Mac in a Finder dialog, else typed);
 #   or in a terminal: python3 scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> [options] (values given on the command line override "Settings", -h lists every option;
 #   without keyboard input a missing value is not asked for but reported as an error; exit code 0 on success, 1 on error, 130 when interrupted). Command-line options entered in Spyder's run configuration work the same way.
 # Uses only three things: this repository, a folder holding one game's NSPs (the base game, with or without an update; DLC NSPs, when present, are packed too and unlock the add-on content already in the game), and prod.keys.
@@ -36,18 +38,19 @@ import romfs as rfs
 import nso   # the code module loader: nso.Error is a damaged module (its file cut short or not what its header says)
 
 # ---- Settings ----
-NSP_DIR = ''                            # folder holding the NSPs (empty = ask at run time)
-PROD_KEYS = ''                          # path of prod.keys (empty = ask at run time)
+NSP_DIR = ''                            # folder holding the NSPs (empty = ask at run time: a Finder dialog on a Mac)
+PROD_KEYS = ''                          # path of prod.keys (empty = ask at run time: a Finder dialog on a Mac)
 PACKAGE = ''                            # version packed into the IPA (empty = the newest in the folder; Mario 'v327680' i.e. 1.2.1, or 'v0')
-OUT_IPA = ''                            # output IPA (empty = <the profile's ipa> in the NSP folder); with PLATFORM 'mac-app' the output app (empty = <game name>.app in the NSP folder)
+OUT_IPA = ''                            # output IPA (empty = <the profile's ipa> in the NSP folder); with PLATFORM 'mac-app' the output app (empty = <game name>.app in the NSP folder); with 'both' the IPA
 APP_NAME = ''                           # app name on the home screen (empty = the game name in the base NSP)
 BUNDLE_ID = ''                          # the app's bundle ID (empty = saved per-game Xcode ID, else org.nxnative.<base game title ID in lowercase>)
 ROMFS = 'bundle'                        # 'bundle' = the game files go into the IPA (or the Xcode app), as always; 'separate' = they stay out (DM_COPY_ROMFS=NO): the IPA is small, and its rebuilds do not pack or send the RomFS again.
                                         #   Copy it to the phone once per game version with the scripts/push_romfs.sh command printed at the end (the app checks that the image is the one it was built for)
 PREPARE_XCODE = False                   # prepare a per-game Xcode project and add it to the workspace instead of packing an IPA; requires KEEP_EXTRACTED
-PLATFORM = 'ios'                        # 'ios' = the IPA (or the Xcode project); 'mac-app' = a double-clickable Mac app of the game; 'mac' = development: build only what running the game on this Mac needs (Mac shaders, the Mac host), no iOS shaders,
+PLATFORM = 'both'                       # 'both' = the IPA, and the Mac app in a disk image (.dmg), in one run (needs Apple silicon; on an Intel Mac, or with PREPARE_XCODE, the default falls back to 'ios');
+                                        #   'ios' = the IPA (or the Xcode project); 'mac-app' = a double-clickable Mac app of the game; 'mac' = development: build only what running the game on this Mac needs (Mac shaders, the Mac host), no iOS shaders,
                                         #   Xcode project or IPA; keeps the extracted files and prints the command that runs the game (needs Apple silicon)
-MAC_SIGN = ''                            # PLATFORM 'mac-app': the codesign identity for the app, e.g. 'Developer ID Application: <name> (<team>)' (empty = ad-hoc); never with the hardened runtime
+MAC_SIGN = ''                            # PLATFORM 'mac-app' or 'both': the codesign identity for the app, e.g. 'Developer ID Application: <name> (<team>)' (empty = ad-hoc); never with the hardened runtime
 TEAM_ID = ''                            # optional Apple team ID; empty = DM_TEAM_ID environment, saved Xcode selection, or select in Xcode
 XCODE_WORKSPACE = ''                    # shared .xcworkspace (empty = NxNative.xcworkspace beside the game's NSP folder)
 LANGUAGE = ''                           # game language, a code or a name: 'ja', 'fr', 'de', 'es', 'zh-Hans', 'zh-Hant', 'ko', 'Japanese', ... (empty = English); it must be one the game supports (the console line lists them);
@@ -57,7 +60,8 @@ DM_ENV_FILE = ''                        # optional: environment switches for a d
 PSO_GPUS = ''                           # NVN games: GPU architectures the app gets the shader pairs' pipeline bases for, made on this Mac (metal-tt, comma-separated: 'g18p' = A19 / A19 Pro of the iPhone 17 family;
                                         #   another device's name is in its log when the app has none for it), so the device does not build them on its first start; each adds about 650 MB to the app (Breath of the Wild) and minutes to a first build; 'none' = no archive;
                                         #   empty = by the game's profile: 'g18p' when it sets pso_mtl4 on (the Metal 4 path, the only one that reads the archive on iOS, is on for it), else 'none'
-                                        #   PLATFORM 'mac-app': the Mac app's archive (Resources/pso), empty = this Mac's GPU (e.g. 'g14s' for an M2 Max), 'none' = the app builds its bases on its first start
+                                        #   PLATFORM 'mac-app': the Mac app's archive (Resources/pso), empty = this Mac's GPU (e.g. 'g14s' for an M2 Max), 'none' = the app builds its bases on its first start;
+                                        #   PLATFORM 'both': the IPA's (the Mac app always gets this Mac's)
 SHOW_FPS = True                         # True shows the game's frame rate on the iPhone (frames on screen per second, top left); DM_SHOW_FPS=0 / 1 in the app's Documents/env.txt changes it without a rebuild
 MOTION = True                           # True passes a gyro controller's motion (on iOS also the phone's own) to games that read it; False builds with DM_MOTION=0, for when motion misbehaves (DM_MOTION=1 in the app's Documents/env.txt turns it back on without a rebuild)
 SURVEY_ONLY = False                     # a game with no profile in dm/games: only write the survey, no provisional profile and no IPA
@@ -325,12 +329,26 @@ def language_list(codes):
     return ', '.join(f'{c} ({names[c]})' for c in codes)
 
 
-def ask(prompt, what):   # what: what is missing, for the error message
+def ask(prompt, what, pick=None):   # what: what is missing, for the error message; pick: (kind, title) of a Finder dialog on a Mac (choose; kind 'folder' or 'file'), else the path is typed
     if PROG.mode == 'json': raise BuildError(f'{what} not given: JSON mode does not prompt; give it on the command line (-h for usage)')
+    if pick and (p := choose(*pick, what)): return p
     if not in_ipython() and not (sys.stdin and sys.stdin.isatty()):
         raise BuildError(f'{what} not given and there is no keyboard input to ask for it: give it on the command line (-h for usage)')
     s = input(prompt).strip().strip('"').strip("'").replace('\\ ', ' ')   # dragged-in paths come quoted or with escaped spaces
     return os.path.expanduser(s)
+
+
+def choose(kind, prompt, what):
+    """A Finder dialog for a folder or a file (AppleScript's choose folder / choose file, through osascript), on a Mac with a screen: not over SSH, where no dialog can be shown.
+    Returns the chosen path, or None when no dialog could be shown (the caller asks for it typed); cancelling the dialog stops the build"""
+    if sys.platform != 'darwin' or os.environ.get('SSH_CONNECTION') or not shutil.which('osascript'): return None
+    where = Path('~/.switch').expanduser() if kind == 'file' else None   # where prod.keys usually is
+    script = ['activate', f'POSIX path of (choose {kind} with prompt "{prompt}"' + (f' default location POSIX file "{where}"' if where and where.is_dir() else '') + ')']
+    try: r = subprocess.run(['osascript', *(a for line in script for a in ('-e', line))], capture_output=True, text=True, timeout=3600)
+    except (OSError, subprocess.TimeoutExpired): return None
+    if r.returncode == 0 and r.stdout.strip(): return r.stdout.strip()
+    if '-128' in r.stderr: raise BuildError(f'no {what} chosen (the dialog was cancelled)')   # User canceled (-128)
+    return None
 
 
 def run(cmd, log, env=None, cwd=None, on_line=None):
@@ -1710,27 +1728,31 @@ def toolchain(repo, env=None):   # Metal is a separate Xcode download: its versi
               for args in (['metal', '--version'], ['metallib', '--version'], ['--show-sdk-version'], ['--show-sdk-build-version'])))
 
 
-def build_shaders(py, repo, sh, xlate, env, logs, g, pkg_key=None, mac=False):
-    """The iOS shader libraries (dmsh_build.py, which also builds the Mac's into sh/cache when the build wants them), or with mac only the Mac's (a Mac-only build: no IOSOUT). Returns the folder the host takes
+def build_shaders(py, repo, sh, xlate, env, logs, g, pkg_key=None, mac=False, both=False):
+    """The iOS shader libraries (dmsh_build.py, which also builds the Mac's into sh/cache when the build wants them), or with mac only the Mac's (a Mac-only build: no IOSOUT), or with both
+    (PLATFORM 'both': the IPA and the Mac app) both in one run, returning the iOS folder (the Mac's is sh/cache). Returns the folder the host takes
     them from. Reused when the shader package (pkg_key, its content; None never reuses) and the chain's tools, translator binaries, profile and compilers are as at the last successful build:
     dmsh_build.py would only restore every shader from its cache (63,000 for Breath of the Wild: about 100 s). The key of the iOS libraries is sh/ios/b-<chain>.key, that of the Mac's
     sh/mac-b-<chain>.key (not in sh/cache, whose b-* entries dmsh_build.py reads as library folders). Each target writes only its own key; either is taken only
     while the Mac sources and reflection carry a full build's stamp (inputs.tsv) for c1_full.tsv and cb_extent.tsv to name (chain_tables).
     Switching targets translates again (the per-shader keys include the iOS compile convention); the Metal compile cache (dmsh_mtlcache.py) reuses previously compiled MSL for that target"""
     ios, log = sh / 'ios', logs / 'dmsh_build.log'
-    PROG.stage('Mac shaders' if mac else 'iOS shaders')
+    mac = mac and not both
+    PROG.stage('iOS and Mac shaders' if both else 'Mac shaders' if mac else 'iOS shaders')
     chain = chain_of(repo)
     out = sh / 'cache' if mac else ios
     libs, kf, kmac = out / f'b-{chain}', ios / f'b-{chain}.key', sh / f'mac-b-{chain}.key'
+    want = [libs, sh / 'cache' / f'b-{chain}'] if both else [libs]   # the library folders this build must leave
     pso_pairs = g.table('pso_pairs.tsv')
     if not pso_pairs.is_file(): pso_pairs = sh / 'pso_pairs.tsv'   # the split's copy is a shader input too (vs_pad)
     if pkg_key:
         PROG.set(step='checking the inputs')
         key = fingerprint(pkg_key, ('files', chain_files(repo)), ('stat', xlate.parent), ('files', profile_files(g)), ('files', [pso_pairs]), *toolchain(repo, env), str(xlate),
                           {k: env.get(k) for k in ('XLATE_DEBUG', 'XLATE_REDUCED')}, env=env)
-        note = next((n for k in ((kmac, kf) if mac else (kf,)) if (n := reused(k, key)) is not None), None)
+        if both: note = (n if (n := reused(kf, key)) is not None and reused(kmac, key) is not None else None)   # each target's own key: an iOS-only or a Mac-only build made only one
+        else: note = next((n for k in ((kmac, kf) if mac else (kf,)) if (n := reused(k, key)) is not None), None)
         # the libraries are the last build's, so are tables that name their stamp; a missing or stale one is made from that build's Mac outputs, and without them the step runs again
-        if next(libs.glob('*_b.metallib'), None) and note is not None and chain_tables(py, repo, sh, env, logs, g, chain):
+        if all(next(d.glob('*_b.metallib'), None) for d in want) and note is not None and chain_tables(py, repo, sh, env, logs, g, chain):
             PROG.end(f'{note}, reused (inputs unchanged)'); return out
     else: key = None
     rmtree(kmac)
@@ -1740,16 +1762,17 @@ def build_shaders(py, repo, sh, xlate, env, logs, g, pkg_key=None, mac=False):
     # The Metal work follows from what the build produces: an iPhone build needs only the iOS libraries (the macOS
     # metallibs are about half of the compile and never enter the IPA), a Mac build only the Mac's, and a build that
     # wants both compiles both. The Mac sources and reflection are written either way (c1_full / cb_extent come from them).
-    benv = dict(env, XLATE=str(xlate), IOSOUT=str(ios), DMSH_TARGETS='mac' if mac else 'ios')
+    benv = dict(env, XLATE=str(xlate), IOSOUT=str(ios), DMSH_TARGETS='mac,ios' if both else 'mac' if mac else 'ios')
     if ALLOW_OTHER_METAL: benv['DM_ALLOW_OTHER_METAL'] = '1'
     if mac: del benv['IOSOUT']   # dmsh_build.py builds the iOS libraries only with IOSOUT
     run([py, repo / 'dm/gfx/tools/own_compilers.py', sh / 'pkg', sh / 'cache'], log, env=benv)
     PROG.watch(None)
     if not chain_tables(py, repo, sh, env, logs, g, chain): raise BuildError(f'no stamped Mac shader outputs in {sh / "cache" / f"b-{chain}"} (inputs.tsv): dmsh_build.py did not finish a full build')
-    what = 'Mac' if mac else 'iOS'
-    n = sum(1 for _ in libs.glob('*_b.metallib')) if libs.is_dir() else 0
-    if n == 0: raise BuildError(f'no {what} shader libraries in {libs}')
-    say(f'{n} {what} shader libraries ({libs})')
+    for d in want:
+        what = 'Mac' if d.parent.name == 'cache' else 'iOS'
+        n = sum(1 for _ in d.glob('*_b.metallib')) if d.is_dir() else 0
+        if n == 0: raise BuildError(f'no {what} shader libraries in {d}')
+        say(f'{n} {what} shader libraries ({d})')
     t = log.read_text(errors='replace')
     if own := re.search(r'^note: (built with this Mac\'s compilers.*)$', t, re.M): say(own.group(1))
     m, c = re.search(r'shaders (\d+): ok (\d+)', t), re.search(r'shader cache: hit (\d+)', t)
@@ -1762,7 +1785,7 @@ def build_shaders(py, repo, sh, xlate, env, logs, g, pkg_key=None, mac=False):
     else: PROG.end()
     shader_regressions(py, repo, sh / 'cache', chain, logs)   # before the key: a stopped build is checked again on the next run
     if key:
-        (kmac if mac else kf).write_text(f'{key}\n{note}\n')
+        for k in (kf, kmac) if both else (kmac,) if mac else (kf,): k.write_text(f'{key}\n{note}\n')
     return out
 
 
@@ -2027,6 +2050,38 @@ def mac_app(py, repo, out, app, work, game, patched, host, font, msl, aoc, gfx, 
     PROG.end(f'{out.name}, ' + ('reused (inputs unchanged)' if unchanged else amount(tree_size(out)[1], 'B')))
 
 
+def mac_dmg(app, dmg, name, work, env, logs):
+    """The last stage of PLATFORM 'both': the Mac app in a disk image (hdiutil create, lzfse-compressed UDIF: ULFO) with a link to /Applications beside it, to drag the app onto.
+    The app goes in through a staging folder of APFS clones in <id>_build/dmg (a plain copy on another file system); the image is written beside its final path and renamed when complete.
+    Made again only when the app's files (paths, sizes, modification times) or the image changed since the last one (<id>_build/dmg.key; pack_app.py leaves an unchanged app as it was)"""
+    PROG.stage('Mac disk image', step='checking the app')
+    kf, key = work / 'dmg.key', fingerprint(('stat', app), str(dmg))
+    st = dmg.stat() if dmg.is_file() else None
+    if st and reused(kf, key) == f'{st.st_size} {st.st_mtime_ns}':
+        PROG.end(f'{dmg.name}, reused (app unchanged)'); return
+    rmtree(kf)
+    size = tree_size(app)[1]
+    if free_gb(dmg.parent) < size / 2**30 + 1: raise BuildError(f'less than {size / 2**30 + 1:.0f} GB free on the volume of {dmg.parent} for the disk image')
+    stage, part = work / 'dmg', dmg.with_name(dmg.stem + '.partial.dmg')
+    rmtree(stage); stage.mkdir(parents=True); rmtree(part)
+    PROG.set(step='staging the app')
+    if subprocess.run(['cp', '-cR', str(app), str(stage)], capture_output=True).returncode:   # clones on APFS; another file system copies
+        rmtree(stage); stage.mkdir(parents=True); run(['cp', '-R', app, stage], logs / 'mac_dmg.log', env=env)
+    (stage / 'Applications').symlink_to('/Applications')
+    PROG.set(step='compressing', done=0, total=100, unit='%')
+    def line(ln):   # -puppetstrings: PERCENT:<0..100> (-1 while it cannot tell)
+        if ln.startswith('PERCENT:'):
+            try: v = float(ln[8:])
+            except ValueError: return
+            if v >= 0: PROG.set(done=int(v))
+    run(['hdiutil', 'create', '-volname', name, '-srcfolder', stage, '-format', 'ULFO', '-fs', 'HFS+', '-ov', '-puppetstrings', part], logs / 'mac_dmg.log', env=env, on_line=line)
+    rmtree(stage)
+    if not part.is_file(): raise BuildError(f'hdiutil wrote no disk image at {part} (see {logs / "mac_dmg.log"})')
+    rmtree(dmg); part.rename(dmg)
+    st = dmg.stat(); kf.write_text(f'{key}\n{st.st_size} {st.st_mtime_ns}\n')
+    PROG.end(f'{dmg.name}, {amount(st.st_size, "B")}')
+
+
 def find_repo(here):   # this file lives in the repository's scripts/; walk up to the level that has dm/tools/nx_extract/Program.cs
     for d in here.parents:
         if (d / 'dm/tools/nx_extract/Program.cs').exists(): return d
@@ -2042,16 +2097,17 @@ def parse_args(argv):
     ap.add_argument('nsp_dir', nargs='?', help='folder holding one game\'s NSPs (default: the NSP_DIR setting, else asked)')
     ap.add_argument('-k', '--keys', help='path of prod.keys (default: the PROD_KEYS setting, else asked)')
     ap.add_argument('-p', '--package', help='version packed into the IPA, e.g. v327680 / v0 (default: the newest in the folder)')
-    ap.add_argument('-o', '--out', help='output IPA, or app with --platform mac-app (default: <the profile\'s ipa>, or <game name>.app, in the NSP folder)')
+    ap.add_argument('-o', '--out', help='output IPA, or app with --platform mac-app (default: <the profile\'s ipa>, or <game name>.app, in the NSP folder); with --platform both the IPA')
     ap.add_argument('--app-name', help='app name on the home screen (default: the game name in the base NSP)')
     ap.add_argument('--bundle-id', help='the app\'s bundle ID (default: saved Xcode ID when preparing again, else org.nxnative.<base game title ID in lowercase>)')
     ap.add_argument('--romfs', choices=('bundle', 'separate'), help='bundle = the game files go into the IPA (default: the ROMFS setting, bundle); separate = they stay out of the IPA and the Xcode app: the build is small and fast, and the RomFS image '
                     'is copied to the phone once per game version with the scripts/push_romfs.sh command printed at the end (the app refuses an image of another version)')
     ap.add_argument('--prepare-xcode', action='store_true', help='prepare a per-game Xcode project and add it to the shared workspace instead of packing an IPA (requires keeping extracted files)')
-    ap.add_argument('--platform', choices=('ios', 'mac', 'mac-app'), help='ios = the IPA (or the Xcode project); mac = for development: build only what running the game on this Mac needs (the Mac shaders and the Mac host, '
+    ap.add_argument('--platform', choices=('both', 'ios', 'mac', 'mac-app'), help='both = the IPA and the Mac app in a disk image (<game name>.dmg in the NSP folder) in one run; ios = the IPA (or the Xcode project); '
+                    'mac = for development: build only what running the game on this Mac needs (the Mac shaders and the Mac host, '
                     'no iOS shaders, Xcode project or IPA), keep the extracted files and print the command that runs the game; mac-app = what mac builds, then a self-contained, double-clickable '
-                    'Mac app of the game (default: <game name>.app in the NSP folder, -o names another) (default: the PLATFORM setting, ios)')
-    ap.add_argument('--mac-sign', help='--platform mac-app: the codesign identity for the app, e.g. "Developer ID Application: <name> (<team>)" (default: the MAC_SIGN setting, else ad-hoc)')
+                    'Mac app of the game (default: <game name>.app in the NSP folder, -o names another) (default: the PLATFORM setting, both; ios on an Intel Mac or with --prepare-xcode)')
+    ap.add_argument('--mac-sign', help='--platform mac-app or both: the codesign identity for the app, e.g. "Developer ID Application: <name> (<team>)" (default: the MAC_SIGN setting, else ad-hoc)')
     ap.add_argument('--team-id', help='Apple developer team ID (default: TEAM_ID setting, DM_TEAM_ID environment, or saved Xcode selection)')
     ap.add_argument('--xcode-workspace', help='workspace collecting prepared games (default: NxNative.xcworkspace beside the NSP folder; use with --prepare-xcode)')
     ap.add_argument('-l', '--language', help='game language, a code or a name: ja, fr, de, es, it, nl, pt, ru, ko, zh-Hans, zh-Hant, en-GB, fr-CA, es-419, pt-BR, Japanese, ... (default: the LANGUAGE setting, else English); '
@@ -2060,7 +2116,7 @@ def parse_args(argv):
     ap.add_argument('--env-file', help='environment switches for a diagnostic build (one KEY=VALUE per line)')
     ap.add_argument('--gpu', help='NVN games: GPU architectures the app gets its pipeline archive for, made on this Mac with metal-tt, comma-separated: g18p (A19 / A19 Pro), or the name a device\'s log gives when the app has no archive for its GPU; '
                     'none = no archive, the device builds the bases on its first start (default: the PSO_GPUS setting; when that is empty, g18p for a game whose profile sets pso_mtl4 on, else none). '
-                    'With --platform mac-app: the Mac app\'s archive, by default for this Mac\'s GPU (none: the app builds the bases on its first start)')
+                    'With --platform mac-app: the Mac app\'s archive, by default for this Mac\'s GPU (none: the app builds the bases on its first start); with --platform both the IPA\'s (the Mac app gets this Mac\'s)')
     ap.add_argument('--show-fps', action=argparse.BooleanOptionalAction, help='show the game\'s frame rate on the iPhone, frames on screen per second at the top left (default: the SHOW_FPS setting, on)')
     ap.add_argument('--motion', action=argparse.BooleanOptionalAction, help='pass a gyro controller\'s motion (on iOS also the phone\'s own) to games that read it; --no-motion builds with DM_MOTION=0, for when motion misbehaves (default: the MOTION setting, on)')
     ap.add_argument('--survey-only', action='store_true', help='a game with no profile: only the survey, no provisional profile and no IPA')
@@ -2142,23 +2198,28 @@ def main(args=None):
     repo = find_repo(here)
     prepare_xcode = args.prepare_xcode or PREPARE_XCODE
     platform = args.platform or PLATFORM
-    if platform not in ('ios', 'mac', 'mac-app'): raise BuildError(f'PLATFORM / --platform must be ios, mac or mac-app: {platform}')
+    if platform not in ('both', 'ios', 'mac', 'mac-app'): raise BuildError(f'PLATFORM / --platform must be both, ios, mac or mac-app: {platform}')
+    if platform == 'both' and not args.platform:   # the default: the IPA alone where no Mac app can be made, or when an Xcode project replaces the IPA
+        if prepare_xcode: platform = 'ios'
+        elif not (sys.platform == 'darwin' and apple_silicon()):
+            platform = 'ios'; say('building the IPA only: the Mac app and its disk image need a Mac with Apple silicon')
+    both = platform == 'both'   # the IPA, then the Mac app and its disk image (mac_dmg) from the same build
     mac = platform in ('mac', 'mac-app')   # the Mac's shaders and host only: no iOS shaders, Xcode project or IPA (mac_run prints the command; mac-app packs a Mac app, mac_app)
-    mac_pack = platform == 'mac-app'
-    if args.mac_sign and not mac_pack: raise BuildError('--mac-sign signs the Mac app: it needs --platform mac-app')
-    if mac and prepare_xcode: raise BuildError(f'--prepare-xcode makes an iPhone project: it cannot be combined with --platform {platform}')
-    if mac and not apple_silicon(): raise BuildError(f'--platform {platform} runs the game in the Mac host, which runs the game\'s own arm64 code natively: it needs a Mac with Apple silicon, and this Mac has an Intel processor')
+    mac_pack = platform in ('mac-app', 'both')   # a Mac app is packed
+    if args.mac_sign and not mac_pack: raise BuildError('--mac-sign signs the Mac app: it needs --platform mac-app or both')
+    if (mac or both) and prepare_xcode: raise BuildError(f'--prepare-xcode makes an iPhone project: it cannot be combined with --platform {platform}')
+    if (mac or both) and not apple_silicon(): raise BuildError(f'--platform {platform} runs the game in the Mac host, which runs the game\'s own arm64 code natively: it needs a Mac with Apple silicon, and this Mac has an Intel processor')
     check_native_python()
     keep = KEEP_EXTRACTED if args.keep_extracted is None else args.keep_extracted
-    if mac and not keep: say('keeping the extracted game files all the same: the game runs from them on the Mac' + (' and the app is made of clones of them' if mac_pack else '')); keep = True
     if prepare_xcode and not keep: raise BuildError('--prepare-xcode requires --keep-extracted: Xcode builds from the extracted files')
     if args.xcode_workspace and not prepare_xcode: raise BuildError('--xcode-workspace requires --prepare-xcode')
     romfs_mode = args.romfs or ROMFS
     if romfs_mode not in ('bundle', 'separate'): raise BuildError(f'ROMFS / --romfs must be bundle or separate: {romfs_mode}')
     if romfs_mode == 'separate' and mac: raise BuildError(f'--romfs separate keeps the game files off the iPhone app: it cannot be combined with --platform {platform}, which runs from the extracted files')
     if romfs_mode == 'separate' and not keep: raise BuildError('--romfs separate requires --keep-extracted: the image must remain available for the one-time transfer to the phone')
-    nsp_dir = Path(os.path.expanduser(args.nsp_dir or NSP_DIR or ask('NSP folder: ', 'the NSP folder'))).resolve()
-    keys = Path(os.path.expanduser(args.keys or PROD_KEYS or ask('path of prod.keys: ', 'prod.keys (-k)'))).resolve()
+    if (mac or both) and not keep: say('keeping the extracted game files all the same: the game runs from them on the Mac' + (' and the app is made of clones of them' if mac_pack else '')); keep = True
+    nsp_dir = Path(os.path.expanduser(args.nsp_dir or NSP_DIR or ask('NSP folder: ', 'the NSP folder', ('folder', 'Choose the folder holding the game\'s NSPs')))).resolve()
+    keys = Path(os.path.expanduser(args.keys or PROD_KEYS or ask('path of prod.keys: ', 'prod.keys (-k)', ('file', 'Choose your prod.keys')))).resolve()
     if not nsp_dir.is_dir(): raise BuildError(f'not a folder: {nsp_dir}')
     if not keys.is_file(): raise BuildError(f'no such file: {keys}')
     sys.path.insert(0, str(repo / 'dm/games')); import game as gamemod   # game profiles
@@ -2217,7 +2278,7 @@ def main(args=None):
     versions = [pkg_ver] if derived else need + ([pkg_ver] if pkg_ver not in need else [])
     out_ipa = Path(os.path.expanduser(args.out or OUT_IPA)).resolve() if (args.out or OUT_IPA) else nsp_dir / g.get('ipa')   # by default in the NSP folder, next to the NSPs and <id>_build/
     if shadowed and not (args.out or OUT_IPA): out_ipa = out_ipa.with_name(out_ipa.stem + '-provisional.ipa')   # never over the IPA of the game's real profile
-    if mac_pack and (args.out or OUT_IPA) and out_ipa.suffix != '.app': raise BuildError(f'the Mac app (-o / OUT_IPA) must end in .app: {out_ipa}')
+    if platform == 'mac-app' and (args.out or OUT_IPA) and out_ipa.suffix != '.app': raise BuildError(f'the Mac app (-o / OUT_IPA) must end in .app: {out_ipa}')
     work = nsp_dir / f'{g.id}_build'
     project = work / 'xcode/DmIOS.xcodeproj'
     workspace = Path(os.path.expanduser(args.xcode_workspace or XCODE_WORKSPACE)).resolve() if (args.xcode_workspace or XCODE_WORKSPACE) else nsp_dir.parent / 'NxNative.xcworkspace'
@@ -2232,7 +2293,7 @@ def main(args=None):
             if not saved_signing and legacy_config.exists() and f'/gen/{g.id}/' in legacy_config.read_text():
                 saved_signing = xcode_projects.signing_settings(repo / 'dm/ios/DmIOS.xcodeproj')
         except ValueError as e: raise BuildError(str(e)) from e
-    say('Mac app: the Mac shaders and the Mac host, packed into a Mac app; no iOS shaders, Xcode project or IPA' if mac_pack else 'Mac-only build for development: the Mac shaders and the Mac host, no iOS shaders, Xcode project or IPA' if mac else f'Xcode project: {project}' if prepare_xcode else f'output IPA: {out_ipa}')
+    say(f'output IPA: {out_ipa}; then the Mac app in a disk image, in the NSP folder' if both else 'Mac app: the Mac shaders and the Mac host, packed into a Mac app; no iOS shaders, Xcode project or IPA' if mac_pack else 'Mac-only build for development: the Mac shaders and the Mac host, no iOS shaders, Xcode project or IPA' if mac else f'Xcode project: {project}' if prepare_xcode else f'output IPA: {out_ipa}')
     say(f'work folder (extracted game files in extract/, {"kept for the next build" if keep else "deleted after the IPA is built"}): {work}')
     xlate = repo / 'dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate'
     # DM_GAME picks the profile; DM_ROOT / WORK point at <id>_build: the tools' default paths and temporary directories all stay inside it
@@ -2245,7 +2306,7 @@ def main(args=None):
     gb = extract_bytes(picks, False) / 2**30 + 6   # every merged image is complete, including on APFS; shader cache + slack
     if free_gb(work) < gb and not all((ex / v).exists() for v in versions): raise BuildError(f'less than {gb:.0f} GB free on the volume of {work}')
     heapck = provisional and HEAP_CHECK and not args.no_heap_check and not heap_checked(g)   # the heap check, when the game needs one (once per provisional profile: it stamps the profile)
-    PROG.plan(1 + len(versions) + bool(fam['dlc']) + 4 - (prepare_xcode or (mac and not mac_pack)))   # prepare Xcode (a Mac-only build: the Mac host) replaces app build + IPA pack with one stage (a Mac app: Mac host + Mac app)
+    PROG.plan(1 + len(versions) + bool(fam['dlc']) + 4 - (prepare_xcode or (mac and not mac_pack)) + 3 * both)   # prepare Xcode (a Mac-only build: the Mac host) replaces app build + IPA pack with one stage (a Mac app: Mac host + Mac app; both: the IPA's, then Mac host + Mac app + disk image)
     PROG.stage('build nx_extract')
     nx = build_nx_extract(repo, work, logs, env)
     PROG.end()
@@ -2295,8 +2356,8 @@ def main(args=None):
         except ValueError as e: raise BuildError(str(e)) from e
     # the app version is the packed game's display version: the update's control data when an update is packed (nx_extract saves it next to the RomFS), else the base game's
     app_version = nacp.version(game / 'control.nacp') or nacp.version(base / 'control.nacp')
-    if mac_pack and not (args.out or OUT_IPA): out_ipa = nsp_dir / f'{mac_app_name(app_name)}{"-provisional" if shadowed else ""}.app'
-    if not mac or mac_pack: say(f'app name: {app_name}; version: {app_version or "1.0"}; bundle ID: {bundle_id}' + (f'; app: {out_ipa}' if mac_pack else ''))
+    out_app = None if not mac_pack else out_ipa if platform == 'mac-app' and (args.out or OUT_IPA) else nsp_dir / f'{mac_app_name(app_name)}{"-provisional" if shadowed else ""}.app'
+    if not mac or mac_pack: say(f'app name: {app_name}; version: {app_version or "1.0"}; bundle ID: {bundle_id}' + (f'; app: {out_app}' if mac_pack else ''))
     # the game language: Horizon gives the game one of the languages its control data lists (the packed version's, which an update may extend), so the one packed must be among them
     have = nacp.languages(game / 'control.nacp') or nacp.languages(base / 'control.nacp')
     lang = game_language(want_lang, bool(lang_in), have)
@@ -2341,19 +2402,21 @@ def main(args=None):
         derive_dlc = (lambda: derive_shader_tables('the installed DLC shader content differs from the registered tables')) if not own else None
         derive_compute = (lambda: derive_shader_tables('the reader decoded additional compute kernels from this registered build')) if not own else None
         pkey = split_shaders(py, repo, [rfs.source(dirs[v]) for v in sv], [dirs[v] / 'ExeFS/main' for v in sv], sh / 'pkg', env, logs, g, own, oodle, dlc_roms, derive_dlc, derive_compute)
-        ios = build_shaders(py, repo, sh, xlate, env, logs, g, pkey, mac)
+        ios = build_shaders(py, repo, sh, xlate, env, logs, g, pkey, mac, both)
     icon = next((d / 'icon.jpg' for d in (game, base) if (d / 'icon.jpg').exists()), None)   # the game icon nx_extract saved from the control data (English, icon.jpg); the packed version's first, then the base game's
     motion = MOTION if args.motion is None else args.motion
     env_file = build_env_file(work, args.env_file or DM_ENV_FILE, motion)
     if not motion: say('motion (gyro): off, DM_MOTION=0 is built in (on the iPhone, DM_MOTION=1 in the app\'s Documents/env.txt turns it back on)')
-    if mac_pack:   # a Mac app: the Mac host, then the app packed from it and the build's files
+    mac_msl = ios if not both else sh / 'cache' if gfx == 'nvn' else sh   # the Mac shader libraries (a 'both' build returned the iOS folder; the Mac's are beside it)
+    def pack_mac_app(gpus):   # the Mac host, then the app packed from it and the build's files
         host, font = mac_host(py, repo, work, env, logs, g)
         if not icon: say('[RED] no game icon in the extraction (an older extraction did not save it: delete extract/ and run again); the app\'s icon will be blank')
-        mac_app(py, repo, out_ipa, app, work, game, patched, host, font, ios, aoc, gfx, lang, g, app_name, app_version, bundle_id, icon, args.mac_sign or MAC_SIGN, env, logs, env_file,
-                (args.gpu or PSO_GPUS).strip())
+        mac_app(py, repo, out_app, app, work, game, patched, host, font, mac_msl, aoc, gfx, lang, g, app_name, app_version, bundle_id, icon, args.mac_sign or MAC_SIGN, env, logs, env_file, gpus)
+    app_where = f'Its save is in ~/Library/Application Support/nxnative/{app:016X}/, its log in ~/Library/Logs/nxnative/{app:016X}.log'
+    if platform == 'mac-app':
+        pack_mac_app((args.gpu or PSO_GPUS).strip())
         rmtree(work / 'tmp')
-        say(f'done: {out_ipa} ({tree_size(out_ipa)[1] / 2**30:.1f} GB); '
-            f'open it from Finder. Its save is in ~/Library/Application Support/nxnative/{app:016X}/, its log in ~/Library/Logs/nxnative/{app:016X}.log')
+        say(f'done: {out_app} ({tree_size(out_app)[1] / 2**30:.1f} GB); open it from Finder. {app_where}')
         report_profile_status(g, reg, pkg_ver, derived, provisional, 'Mac app', patched)
         return
     if mac:   # a Mac-only build ends with the Mac host and the command that runs the game
@@ -2402,12 +2465,17 @@ def main(args=None):
     run(['bash', repo / 'dm/ios/tools/build_ipa.sh', out_ipa], logs / 'build_ipa.log', env=ipa_env, on_line=watch.line)
     if not out_ipa.is_file(): raise BuildError(f'no IPA at {out_ipa}')
     PROG.end(f'{out_ipa.name}, {amount(out_ipa.stat().st_size, "B")}')
+    dmg = out_app.with_suffix('.dmg') if both else None
+    if both:   # the Mac app from the same build (its pipeline archive for this Mac's GPU: PSO_GPUS names the iPhone's here), then its disk image
+        pack_mac_app('none' if (args.gpu or PSO_GPUS).strip() == 'none' else '')   # --gpu none: no archive for either
+        mac_dmg(out_app, dmg, out_app.stem, work, env, logs)
     rmtree(work / 'tmp')
     if not keep:
         say(f'deleting the extracted game files: {ex}'); rmtree(ex)
     say(f'done: {out_ipa} ({out_ipa.stat().st_size / 2**30:.1f} GB)')
+    if both: say(f'done: {dmg} ({dmg.stat().st_size / 2**30:.1f} GB), the Mac app in a disk image: open it and drag the app onto Applications (the app itself is at {out_app}). {app_where}')
     if separate: say_push_romfs(rfs.source(game), bundle_id)
-    report_profile_status(g, reg, pkg_ver, derived, provisional, patched=patched)
+    report_profile_status(g, reg, pkg_ver, derived, provisional, 'IPA and Mac app' if both else 'IPA', patched=patched)
 
 
 def cli(argv):   # returns the exit code: 0 done, 1 error, 130 interrupted
